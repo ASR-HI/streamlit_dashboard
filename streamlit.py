@@ -12,7 +12,13 @@ import seaborn as sns
 import plotly.express as px
 import plotly.graph_objects as go
 from wordcloud import WordCloud
+import pyspark.sql.functions as F
+from pyspark.sql import SparkSession
+from wordcloud import WordCloud
+from pyspark.sql.functions import udf, when, size, col, regexp_replace, concat_ws , regexp_extract, count, split, lower , trim, year, month
 
+from pyspark.sql.types import DateType
+spark = SparkSession.builder.appName("PandasToPySpark").getOrCreate()
 
 # Load environment variables
 load_dotenv()
@@ -237,10 +243,110 @@ def plot_country_Contributions(new_journaux_df):
     plt.tight_layout()
     st.pyplot(plt)
 
+def process_keywords(df_with_dates):
+    # Split keywords by comma, trim spaces, convert to lowercase, and explode into individual keywords
+    df_with_dates['keywords'] = df_with_dates['keywords'].str.split(',')
+    df_keywords = df_with_dates.explode('keywords')
+    
+    # Clean up each keyword: trim spaces and convert to lowercase
+    df_keywords['keywords'] = df_keywords['keywords'].str.strip().str.lower()
+    
+    # Remove duplicates in the exploded keywords (across all rows)
+    df_keywords_unique = df_keywords.drop_duplicates(subset=['keywords'])
+    
+    # Count the frequency of each unique keyword
+    df_keywords_grouped = df_keywords.groupby('keywords').size().reset_index(name='keyword_count')
+    
+    # Sort the keyword counts in descending order
+    df_keywords_grouped = df_keywords_grouped.sort_values(by='keyword_count', ascending=False)
+    
+    # Create a bar plot for the most common keywords
+    fig = px.bar(
+        df_keywords_grouped.head(10),
+        x='keywords',
+        y='keyword_count',
+        title='Top 10 Most Common Keywords',
+        labels={'keywords': 'Keyword', 'keyword_count': 'Count'}
+    )
+    
+    # Customize plot appearance
+    fig.update_traces(marker=dict(color='#8da0cb'))
+    
+    st.plotly_chart(fig)
 
 
+def NumberArticlesperYear(articles_pd):
+    # Drop 'authors_data' column if exists
+    df = articles_pd.copy()
+    df = df.drop(columns=['authors_data'], errors='ignore')
+    
+    # Convert 'publication_date' column to datetime format
+    df['publication_date'] = pd.to_datetime(df['publication_date'])
+    
+    # Group by 'publication_date' and count the number of articles per date
+    df_grouped = df.groupby('publication_date').size().reset_index(name='article_count')
+    
+    # Sort by 'publication_date'
+    df_grouped = df_grouped.sort_values(by=['publication_date'], ascending=[True])
+    
+    # Create an interactive time series plot using Plotly
+    fig = px.line(df_grouped,
+                  x='publication_date',
+                  y='article_count',
+                  title='Number of Articles by Date',
+                  labels={'publication_date': 'Date', 'article_count': 'Number of Articles'},
+                  markers=True)
+    
+    # Customize the plot's appearance
+    fig.update_traces(
+        line=dict(color='#6B5B95', width=4, dash='solid'),
+        marker=dict(size=8, color='#FFB6C1', symbol='circle', line=dict(color='#6B5B95', width=2))
+    )
 
-
+    fig.update_layout(
+        title_font_size=24,
+        title_font_color='rgba(94, 45, 120, 1)',
+        title_x=0.5,
+        xaxis_title_font_size=16,
+        yaxis_title_font_size=16,
+        xaxis_title_font_color='rgba(94, 45, 120, 1)',
+        yaxis_title_font_color='rgba(94, 45, 120, 1)',
+        xaxis=dict(tickangle=45, tickfont=dict(size=12, color='rgba(94, 45, 120, 0.7)'), showgrid=True),
+        yaxis=dict(tickfont=dict(size=12, color='rgba(94, 45, 120, 0.7)'), showgrid=True),
+        template='plotly_white',
+        hovermode='x unified',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        showlegend=False,
+    )
+    
+    # Add animation frames for smooth transitions
+    frames = [dict(
+        data=[dict(
+            type='scatter',
+            x=df_grouped['publication_date'][:i+1],
+            y=df_grouped['article_count'][:i+1],
+            mode='lines+markers',
+            marker=dict(size=12, color='#98FB98', symbol='circle', line=dict(color='#FFB6C1', width=4))
+        )],
+        name=str(i)
+    ) for i in range(len(df_grouped))]
+    
+    # Add animation buttons
+    fig.update_layout(
+        updatemenus=[dict(
+            type='buttons',
+            showactive=False,
+            buttons=[dict(label='Play',
+                        method='animate',
+                        args=[None, dict(frame=dict(duration=500, redraw=True), fromcurrent=True)])]
+        )]
+    )
+    
+    fig.frames = frames
+    
+    # Show the interactive plot
+    st.plotly_chart(fig)
 
 
 # Main function to run the Streamlit app
@@ -260,7 +366,9 @@ def main():
     authors_labs_pd, journaux_pd, articles_pd, exploded_df, new_journaux_df = fetch_and_process_data()
 
     if data_type == "Articles":
-        st.write(articles_pd.head())
+        #st.write(articles_pd.head())
+        NumberArticlesperYear(articles_pd)
+        process_keywords(articles_pd)   
     elif data_type == "Authors":
         st.write(authors_labs_pd.head())
     elif data_type == "Journals":
