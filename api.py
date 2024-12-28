@@ -1,7 +1,7 @@
 import matplotlib
 matplotlib.use('Agg')  # Utiliser le backend sans interface graphique
 from wordcloud import WordCloud
-from pyspark.sql.functions import udf, when, size, col, regexp_replace, concat_ws , regexp_extract, count, split, lower , trim, year, month
+from pyspark.sql.functions import udf, when, size, col, regexp_replace, concat_ws , regexp_extract, count, split, lower , trim, year, month, array_sort, desc, array, explode
 
 from pyspark.sql.types import DateType
 from datetime import datetime
@@ -11,24 +11,34 @@ import plotly.graph_objects as go
 import plotly.express as px
 import pandas as pd
 import io
+import os
 import base64
 from flask import Flask, jsonify
 from pymongo import MongoClient
 from pyspark.sql import SparkSession
 import json
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import explode, col
 import seaborn as sns
+import networkx as nx
+from dotenv import load_dotenv
+load_dotenv()
+mongo_uri = os.getenv("MONGO_URI")
 
 app = Flask(__name__)
 
 # MongoDB client setup
-client = MongoClient("mongodb+srv://user:user_password@cluster0.d7aq0.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+client = MongoClient(mongo_uri)
 db = client["scraping_data_final"]
+
+
+# Set the path to your Python executable
+os.environ['PYSPARK_PYTHON'] = 'C:\\Users\\pc\\AppData\\Local\\Programs\\Python\\Python311\\python.exe'
 
 # Créer une session Spark
 spark = SparkSession.builder \
     .appName("Data Cleaning") \
+    .config("spark.worker.timeout", "600") \
+    .config("spark.python.worker.reuse", "true") \
     .getOrCreate()
 
 # Fonction pour exporter une collection MongoDB en fichier JSON
@@ -155,6 +165,73 @@ df_keywords_grouped = (
     .orderBy('keyword_count', ascending=False)
 )
 
+articles = df_with_dates
+
+# 1. Exploser les auteurs et leurs laboratoires dans articles_df
+exploded_authors_df = articles.withColumn(
+    "author", explode("authors_data")
+).select(
+    "article_title",
+    "doi",
+    "author.name",
+    "author.labs"
+)
+
+# 2. Exploser la liste des laboratoires (car un auteur peut avoir plusieurs laboratoires)
+exploded_labs_df = exploded_authors_df.withColumn(
+    "lab", explode("labs")
+).select(
+    "article_title",
+    "doi",
+    "name",
+    "lab"
+)
+
+# 3. Renommer la colonne 'name' de authors_labs_df pour éviter l'ambiguïté
+authors_labs_df_renamed = authors_labs_df.withColumnRenamed("name", "lab_name")
+
+# 4. Joindre avec authors_labs_df pour obtenir les pays associés aux laboratoires
+authors_with_country_df = exploded_labs_df.join(
+    authors_labs_df_renamed,
+    exploded_labs_df["lab"] == authors_labs_df_renamed["lab"],
+    "left"
+).select(
+    "article_title",
+    "doi",
+    "name",  # Auteur
+    "lab_name",  # Nouveau nom de la colonne 'name'
+    "Country"
+)
+
+# 5. Créer des paires de pays collaborant ensemble dans un même article, sans double comptage
+collaboration_df = authors_with_country_df.alias("a").join(
+    authors_with_country_df.alias("b"),
+    (col("a.doi") == col("b.doi")) & (col("a.Country") != col("b.Country")),
+    "inner"
+).select(
+    array_sort(array("a.Country", "b.Country")).alias("Country"),
+    "a.doi"  # Ajouter 'doi' pour garantir que la collaboration est pour le même article
+)
+
+# 6. Supprimer les doublons de pays pour chaque article
+distinct_collaboration_df = collaboration_df.distinct()
+
+# 7. Grouper par paire de pays et compter le nombre de collaborations distinctes
+country_collaboration_df = distinct_collaboration_df.groupBy("Country").agg(
+    count("doi").alias("collaboration_count")
+).orderBy(desc("collaboration_count"))
+
+# Afficher les résultats
+# country_collaboration_df.show(truncate=False)
+
+
+
+
+
+
+
+
+print("-------------------------traitement des données terminé-------------------------")
 
 # Fonction pour générer le graphique
 def generate_plot(final_df):
@@ -170,7 +247,6 @@ def generate_plot(final_df):
     # Personnaliser le graphique
     plt.xlabel('Collection')
     plt.ylabel('Row Count')
-    plt.title('Row Count Before and After Dropping Duplicates')
     plt.xticks([i + bar_width / 2 for i in index], [x['Collection'] for x in final_df], rotation=45)
     plt.legend()
 
@@ -212,23 +288,24 @@ def traiter_journaux(journaux_df):
 def generate_plot_Q_par_Catego():
     # Vous devez d'abord traiter `journaux_df` et le convertir en DataFrame pandas
     pandas_journaux_df = traiter_journaux(journaux_df).toPandas()  # Assurez-vous que cette fonction existe et que `journaux_df` est bien défini
-    plt.figure(figsize=(20, 6))
+    plt.figure(figsize=(30,20))  # Augmenter la hauteur de la figure pour mieux voir les catégories
     sns.countplot(data=pandas_journaux_df, x='Category', hue='Quartile', palette='Set1')
-    plt.title('Distribution of Quartiles per Category')
-    plt.xticks(rotation=90)
+    plt.xticks(rotation=90, ha='right')  # Rotation des labels et alignement à droite
     plt.xlabel('Category')
     plt.ylabel('Count')
-         # Enregistrer le graphique dans un buffer
+    plt.tight_layout()  # Assurer que tout s'affiche correctement
+    # Enregistrer le graphique dans un buffer
     img = io.BytesIO()
-    plt.tight_layout()
     plt.savefig(img, format='png')
     img.seek(0)
     # Convertir l'image en base64
     img_base64 = base64.b64encode(img.getvalue()).decode('utf-8')
     return img_base64
+
 def generate_heatmap_Q_par_Catego_Year():
-    # Vous devez d'abord traiter `journaux_df` et le convertir en DataFrame pandas
-    pandas_journaux_df = traiter_journaux(journaux_df).toPandas()  # Assurez-vous que cette fonction existe et que `journaux_df` est bien défini
+    # Convertir journaux_df en DataFrame pandas
+    pandas_journaux_df = traiter_journaux(journaux_df).toPandas()
+
     # Create pivot table
     heatmap_data = pandas_journaux_df.pivot_table(
         index='Category',
@@ -252,28 +329,32 @@ def generate_heatmap_Q_par_Catego_Year():
 
     heatmap_data = heatmap_data.fillna('').applymap(map_quartile)
 
-    # Plot the heatmap
-    plt.figure(figsize=(12, 8))
-    sns.heatmap(
+    # Plot the heatmap using Plotly
+    fig = px.imshow(
         heatmap_data,
-        annot=True,         # Annotate cells with values
-        cmap='YlGnBu',      # Color map for heatmap
-        cbar=True,          # Show color bar
-        fmt="d"             # Format annotations as integers
+        labels=dict(x="Year", y="Category", color="Quartile"),
+        x=heatmap_data.columns,
+        y=heatmap_data.index,
+        color_continuous_scale='YlGnBu'
     )
 
-    # Add titles and labels
-    plt.title('Heatmap of Quartiles by Year and Category', fontsize=16)
-    plt.xlabel('Year', fontsize=12)
-    plt.ylabel('Category', fontsize=12)
-    plt.xticks(rotation=45)  # Rotate x-axis labels for better readability
-    img = io.BytesIO()
-    plt.tight_layout()
-    plt.savefig(img, format='png')
-    img.seek(0)
-    # Convertir l'image en base64
-    img_base64 = base64.b64encode(img.getvalue()).decode('utf-8')
-    return img_base64
+    # Customize the layout
+    fig.update_layout(
+        xaxis=dict(
+            title="Year",
+            tickangle=45,  # Rotate x-axis labels for better readability
+            tickfont=dict(size=10)  # Adjust font size
+        ),
+        yaxis=dict(
+            title="Category",
+            tickfont=dict(size=10)  # Adjust font size
+        ),
+        width=1400,  # Increase figure width
+        height=800,  # Adjust height for better proportions
+        margin=dict(l=300, r=50, t=50, b=150),  # Adjust margins
+    )
+
+    return fig
 
 def generate_plot_Q_par_Year_TS():
     # Group data by Year and Quartile and calculate counts
@@ -285,7 +366,6 @@ def generate_plot_Q_par_Year_TS():
     sns.lineplot(data=quartile_counts, x='Year', y='Count', hue='Quartile', marker='o', palette='Set2')
 
     # Add plot title and labels
-    plt.title('Time Series of Quartile Distribution Over the Years')
     plt.xlabel('Year')
     plt.ylabel('Count of Publications')
     plt.xticks(rotation=90)  # Rotate x-axis labels for better visibility
@@ -313,7 +393,6 @@ def generate_wordcloud_categories_journaux():
     plt.figure(figsize=(10, 6))
     plt.imshow(wordcloud, interpolation='bilinear')
     plt.axis('off')  # Turn off axis
-    plt.title('Word Cloud of Categories Distribution')
 
     img = io.BytesIO()
     plt.tight_layout()
@@ -331,7 +410,6 @@ def generate_plot_Q_par_Year():
     sns.countplot(data=pandas_journaux_df, x='Year', hue='Quartile', palette='Set2')
 
     # Add plot title and labels
-    plt.title('Distribution of Quartiles Over Time')
     plt.xlabel('Year')
     plt.ylabel('Count of Publications')
     plt.xticks(rotation=90)  # Rotate x-axis labels for better visibility
@@ -363,7 +441,6 @@ def generate_plot_Q_par_Year_TS2():
     )
 
     # Add plot enhancements
-    plt.title('Time Series of Quartile Distribution Over the Years', fontsize=18, weight='bold')
     plt.xlabel('Year', fontsize=14)
     plt.ylabel('Count of Publications', fontsize=14)
     plt.xticks(rotation=45, fontsize=12)
@@ -428,7 +505,6 @@ def generate_contributions_by_Q():
     df_long = new_journaux_df.melt(id_vars='Country', var_name='Quarter', value_name='Count')
     plt.figure(figsize=(10, 6))
     sns.histplot(data=df_long, x='Count', hue='Quarter', kde=True, bins=20, palette='Set2', edgecolor='black', multiple="stack")
-    plt.title('Distribution of Contributions by Quarter (Q1, Q2, Q3, Q4)', fontsize=16, weight='bold')
     plt.xlabel('Count', fontsize=12)
     plt.ylabel('Frequency', fontsize=12)
     plt.legend(title='Quarter', fontsize=10, title_fontsize=12, loc='upper right')
@@ -504,7 +580,6 @@ def generate_contributions_by_Q2():
     )
 
     # Add titles and labels
-    plt.title('Distribution of Contributions by Quarter (Q1, Q2, Q3, Q4)', fontsize=16, weight='bold')
     plt.xlabel('Count', fontsize=12)
     plt.ylabel('Frequency', fontsize=12)
 
@@ -547,7 +622,6 @@ def generate_contributions_by_Q_by_Country():
         palette='Set2',
         edgecolor='black'
     )
-    plt.title('Distribution of Contributions by Quarter (Q1, Q2, Q3, Q4) for Each Country', fontsize=16, weight='bold')
     plt.xlabel('Country', fontsize=12)
     plt.ylabel('Count', fontsize=12)
     plt.legend(title='Quarter', fontsize=10, title_fontsize=12, loc='upper right')
@@ -585,7 +659,7 @@ def generate_country_contribution_by_Q():
 
     df_long = new_journaux_df.melt(id_vars='Country', var_name='Quarter', value_name='Count')
     countries = df_long['Country'].unique()
-    n_columns =  4
+    n_columns =  2
     n_rows = (len(countries) // n_columns) + (len(countries) % n_columns > 0)  # Calculate the number of rows
 
     fig, axes = plt.subplots(n_rows, n_columns, figsize=(5 * n_columns, 5 * n_rows))
@@ -646,22 +720,11 @@ def generate_bubble_chart_Q_par_Country():
 
     # Update layout: center the title and add axis labels
     fig.update_layout(
-        title={
-            'text': "Bubble Chart: Distribution of % Quartiles by Country",
-            'x': 0.5,  # Centers the title
-            'xanchor': 'center',
-            'yanchor': 'top'
-        },
+
         xaxis_title="Country",
         yaxis_title="Quartile"
     )
-    # Convert the plot to a base64 string
-    img = io.BytesIO()
-    fig.write_image(img, format='png')
-    img.seek(0)
-    img_base64 = base64.b64encode(img.getvalue()).decode('utf-8')
-
-    return img_base64
+    return fig
     
 def generate_map_Q_par_Country():
     pandas_journaux_df = traiter_journaux(journaux_df).toPandas()  # Assurez-vous que cette fonction existe et que `journaux_df` est bien défini
@@ -685,7 +748,8 @@ def generate_map_Q_par_Country():
     # Quartiles et leurs noms respectifs
     quartiles = ['Q1', 'Q2', 'Q3', 'Q4']
 
-# Créer un graphique pour chaque quartile
+    figures = []
+    # Créer un graphique pour chaque quartile
     for quartile in quartiles:
         fig = go.Figure()
 
@@ -721,24 +785,18 @@ def generate_map_Q_par_Country():
                 projection_type='natural earth'  # Type de projection pour les cartes
             )
         )
-
-        # Enregistrer le graphique dans un buffer
     
-    img = io.BytesIO()
-    fig.write_image(img, format='png')
-    img.seek(0)
-    # Convertir l'image en base64
-    img_base64 = base64.b64encode(img.getvalue()).decode('utf-8')
-    return img_base64
+        figures.append(fig)
+    
+    return figures
 
 def genrate_plot_authors_par_pays():
     authors_labs_pd = authors_labs_df.toPandas()
-    country_counts = authors_labs_pd['Country'].value_counts().head(20)
+    country_counts = authors_labs_pd['country'].value_counts().head(20)
 
     plt.figure(figsize=(10, 6))
     sns.barplot(x=country_counts.values, y=country_counts.index, palette='viridis')
-    plt.title("Répartition des auteurs par pays top 20")
-    plt.xlabel("Nombre d'auteurs")
+    plt.xlabel("Nombre d'auteurs")  
     plt.ylabel("Pays")
     plt.tight_layout()
     img = io.BytesIO()
@@ -752,9 +810,8 @@ def genrate_plot_top_20_labs():
     # 2. Top 20 laboratoires les plus représentés
     top_labs = authors_labs_pd['lab'].value_counts().head(20)
 
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(12, 8))  # Increase the figure size
     sns.barplot(x=top_labs.values, y=top_labs.index, palette='coolwarm')
-    plt.title("Top 10 laboratoires les plus représentés")
     plt.xlabel("Nombre d'auteurs")
     plt.ylabel("Laboratoire")
     plt.tight_layout()
@@ -774,38 +831,24 @@ def genrate_plot_top_20_labs2():
         x='count',
         y='lab',
         orientation='h',
-        title="Top 20 laboratoires avec le plus d’auteurs",
         labels={'count': 'Nombre d’auteurs', 'lab': 'Laboratoire'},
         color='count',
         color_continuous_scale='Aggrnyl'
     )
-    fig.update_layout(title_x=0.5)
-    plt.tight_layout()
-    img = io.BytesIO()
-    plt.savefig(img, format='png')
-    img.seek(0)
-    img_base64 = base64.b64encode(img.getvalue()).decode('utf-8')
-    return img_base64
+    return fig
 
 
 def generate_map_authors():
     authors_labs_pd = authors_labs_df.toPandas()
-    country_counts = authors_labs_pd['Country'].value_counts().head(20)
+    country_counts = authors_labs_pd['country'].value_counts().head(20)
     country_counts_df = country_counts.reset_index()
     country_counts_df.columns = ['country', 'count']
 
     fig = px.choropleth(country_counts_df,
                         locations="country",
                         locationmode="country names",
-                        color="count",
-                        title="Répartition géographique des auteurs")
-    fig.update_layout(title_x=0.5)
-    
-    img = io.BytesIO()
-    fig.write_image(img, format='png')
-    img.seek(0)
-    img_base64 = base64.b64encode(img.getvalue()).decode('utf-8')
-    return img_base64
+                        color="count")
+    return fig
 
 
 
@@ -834,7 +877,6 @@ def generate_plot_number_of_articles_par_year():
     # Plotting the time series
     plt.figure(figsize=(10, 6))
     plt.plot(articles_by_year_pd['year'], articles_by_year_pd['article_count'], marker='o', linestyle='-', color='b')
-    plt.title("Number of Articles Per Year", fontsize=14)
     plt.xlabel("Year", fontsize=12)
     plt.ylabel("Article Count", fontsize=12)
     plt.grid(True)
@@ -863,7 +905,6 @@ def generate_plot_number_of_articles_par_date():
     plt.plot(df_pandas['publication_date'], df_pandas['article_count'], marker='o', linestyle='-', color='b')
 
     # Add titles and labels
-    plt.title('Number of Articles by Date')
     plt.xlabel('Date')
     plt.ylabel('Number of Articles')
     plt.xticks(rotation=45)  # Rotate date labels for better readability
@@ -890,7 +931,6 @@ def generate_plot_number_of_articles_par_date2():
     fig = px.line(df_pandas,
                 x='publication_date',
                 y='article_count',
-                title='Number of Articles by Date',
                 labels={'publication_date': 'Date', 'article_count': 'Number of Articles'},
                 markers=True)
 
@@ -898,19 +938,13 @@ def generate_plot_number_of_articles_par_date2():
     fig.update_traces(line=dict(color='blue', width=2),  # Line color and width
                     marker=dict(size=6, color='red', symbol='circle', line=dict(color='black', width=2)))  # Markers
     fig.update_layout(
-        title_font_size=20,  # Title font size
-        title_x=0.5,  # Title alignment
         xaxis_title_font_size=14,  # X-axis label font size
         yaxis_title_font_size=14,  # Y-axis label font size
         xaxis=dict(tickangle=45),  # Rotate x-axis labels for better readability
         template='plotly_dark',  # Dark theme
         hovermode='x unified'  # Hover over the x-axis to show all data at that point
     )
-    img = io.BytesIO()
-    fig.write_image(img, format='png')
-    img.seek(0)
-    img_base64 = base64.b64encode(img.getvalue()).decode('utf-8')
-    return img_base64
+    return fig
 
 
 def generate_plot_number_of_articles_par_date3():
@@ -927,7 +961,6 @@ def generate_plot_number_of_articles_par_date3():
     fig = px.line(df_pandas,
                 x='publication_date',
                 y='article_count',
-                title='Number of Articles by Date',
                 labels={'publication_date': 'Date', 'article_count': 'Number of Articles'},
                 markers=True)
 
@@ -937,8 +970,7 @@ def generate_plot_number_of_articles_par_date3():
 
     # Update layout with white background and cute pastel theme
     fig.update_layout(
-        title_font_size=20,  # Title font size
-        title_x=0.5,  # Title alignment
+        
         xaxis_title_font_size=14,  # X-axis label font size
         yaxis_title_font_size=14,  # Y-axis label font size
         xaxis=dict(tickangle=45),  # Rotate x-axis labels for better readability
@@ -947,11 +979,7 @@ def generate_plot_number_of_articles_par_date3():
         plot_bgcolor='white',  # Set the plot background to white
         paper_bgcolor='white',  # Set the entire paper background to white
     )
-    img = io.BytesIO()
-    fig.write_image(img, format='png')
-    img.seek(0)
-    img_base64 = base64.b64encode(img.getvalue()).decode('utf-8')
-    return img_base64
+    return fig
 
 def generate_plot_number_of_articles_par_date4():
     # Group by 'publication_date' and count the number of articles
@@ -967,7 +995,6 @@ def generate_plot_number_of_articles_par_date4():
     fig = px.line(df_pandas,
                 x='publication_date',
                 y='article_count',
-                title='Number of Articles by Date',
                 labels={'publication_date': 'Date', 'article_count': 'Number of Articles'},
                 markers=True)
 
@@ -991,9 +1018,6 @@ def generate_plot_number_of_articles_par_date4():
 
     # Update layout with a light, pastel-colored background, and playful font styles
     fig.update_layout(
-        title_font_size=30,  # Large title font size to grab attention
-        title_font_color='rgba(255, 182, 193, 1)',  # Pastel pink title color
-        title_x=0.5,  # Center the title
         xaxis_title_font_size=18,  # X-axis label font size
         yaxis_title_font_size=18,  # Y-axis label font size
         xaxis_title_font_color='rgba(255, 182, 193, 1)',  # Pastel pink axis title color
@@ -1016,11 +1040,7 @@ def generate_plot_number_of_articles_par_date4():
 
     # Add frames to the layout
     fig.frames = frames
-    img = io.BytesIO()
-    fig.write_image(img, format='png')
-    img.seek(0)
-    img_base64 = base64.b64encode(img.getvalue()).decode('utf-8')
-    return img_base64
+    return fig
 
 
 
@@ -1034,18 +1054,12 @@ def generate_top_10_keywords():
         df_keywords_pandas.head(10),
         x='keyword',
         y='keyword_count',
-        title='Top 10 Most Common Keywords',
         labels={'keyword': 'Keyword', 'keyword_count': 'Count'}
     )
 
     # Customize plot appearance
     fig.update_traces(marker=dict(color='#8da0cb'))
-    fig.update_layout(title_x=0.5)
-    img = io.BytesIO()
-    fig.write_image(img, format='png')
-    img.seek(0)
-    img_base64 = base64.b64encode(img.getvalue()).decode('utf-8')
-    return img_base64
+    return fig
 
 def generate_wordcloud_keywords():
     df_keywords_pandas = df_keywords_grouped.toPandas()
@@ -1081,16 +1095,11 @@ def generate_top_10_authors_with_most_articles():
     fig = px.bar(df_authors_pandas.head(10),
                 x='name',
                 y='article_count',
-                title='Top 10 Authors with Most Articles',
                 labels={'name': 'Author', 'article_count': 'Article Count'})
 
     # Customize plot appearance
     fig.update_traces(marker=dict(color='#a6d854'))
-    img = io.BytesIO()
-    fig.write_image(img, format='png')
-    img.seek(0)
-    img_base64 = base64.b64encode(img.getvalue()).decode('utf-8')
-    return img_base64
+    return fig
 
 def generate_articles_by_journal():
     # Group by journal name and count the number of articles per journal
@@ -1102,16 +1111,10 @@ def generate_articles_by_journal():
     # Create a pie chart for the distribution of articles by journal name
     fig = px.pie(df_journals_pandas,
                 names='journal_name',
-                values='article_count',
-                title='Article Distribution by Journal')
-
+                values='article_count')
     # Customize plot appearance
     fig.update_traces(marker=dict(colors=['#66c2a5', '#fc8d62', '#8da0cb', '#e78ac3', '#a6d854']))
-    img = io.BytesIO()
-    fig.write_image(img, format='png')
-    img.seek(0)
-    img_base64 = base64.b64encode(img.getvalue()).decode('utf-8')
-    return img_base64
+    return fig
 
 def generate_3d_articles_by_journal():
     # Group by journal name and count the number of articles per journal
@@ -1147,14 +1150,9 @@ def generate_3d_articles_by_journal():
                 eye=dict(x=1.25, y=1.25, z=0.75)  # Adjust the camera position for better 3D view
             )
         ),
-        title='3D Article Distribution by Journal with Bubble Sizes',
         font=dict(size=14),
     )
-    img = io.BytesIO()
-    fig.write_image(img, format='png')
-    img.seek(0)
-    img_base64 = base64.b64encode(img.getvalue()).decode('utf-8')
-    return img_base64
+    return fig
 
 
 
@@ -1177,7 +1175,6 @@ def heatmap_articles_by_year_and_month():
     # Create a heatmap
     plt.figure(figsize=(10, 6))
     sns.heatmap(df_heatmap_pivot, annot=True, cmap="YlGnBu", fmt="d", linewidths=.5)
-    plt.title('Heatmap of Articles Over Time (Year vs. Month)', fontsize=14)
     plt.xlabel('Month', fontsize=12)
     plt.ylabel('Year', fontsize=12)
     plt.xticks(rotation=45)
@@ -1211,7 +1208,6 @@ def generate_articles_by_country():
     plt.bar(articles_by_country['Country'], articles_by_country['article_count'], color='skyblue')
     plt.xlabel('Country')
     plt.ylabel('Number of Articles')
-    plt.title('Number of Articles by Country')
 
     # Rotation des labels de l'axe x pour éviter les chevauchements
     plt.xticks(rotation=45, ha='right')
@@ -1254,27 +1250,297 @@ def generate_map_articles_by_country():
 
     # Ajouter un titre et des informations de mise en page
     fig.update_layout(
-        title='Number of Articles by Country',      # Titre de la carte
-        title_x=0.5,                               # Centrer le titre
         geo=dict(
             showframe=False,
             showcoastlines=True,
             projection_type='equirectangular',     # Projection de la carte
         )
     )
-    img = io.BytesIO()
-    fig.write_image(img, format='png')
-    img.seek(0)
-    img_base64 = base64.b64encode(img.getvalue()).decode('utf-8')
-    return img_base64
+    return fig
 
+
+def generate_tableau_journaux():
+    final_flattened_journaux_df = traiter_journaux(journaux_df).toPandas()
+    fig = go.Figure(data=[go.Table(
+        header=dict(values=list(final_flattened_journaux_df.columns),
+                    fill_color='paleturquoise',
+                    align='left'),
+        cells=dict(values=[final_flattened_journaux_df[col] for col in final_flattened_journaux_df.columns],
+                   fill_color='lavender',
+                   align='left'))
+    ])
+
+    return fig
+
+
+
+
+def generate_graph_collaborations():
+    # Convertir les résultats en Pandas DataFrame
+    collaboration_pd = country_collaboration_df.toPandas()
+
+    # Créer un graphe vide
+    G = nx.Graph()
+
+    # Ajouter des arêtes (collaborations) dans le graphe
+    for _, row in collaboration_pd.iterrows():
+        countries = row['Country']
+        collaboration_count = row['collaboration_count']
+
+        # Ajouter une arête entre les pays, avec le poids de l'arête (nombre de collaborations)
+        G.add_edge(countries[0], countries[1], weight=collaboration_count)
+
+    # Obtenir les positions des nœuds
+    pos = nx.spring_layout(G, k=0.5, seed=42, iterations=50)
+
+    # Extraire les données pour Plotly
+    edge_x = []
+    edge_y = []
+    for edge in G.edges(data=True):
+        x0, y0 = pos[edge[0]]
+        x1, y1 = pos[edge[1]]
+        edge_x.append(x0)
+        edge_x.append(x1)
+        edge_x.append(None)
+        edge_y.append(y0)
+        edge_y.append(y1)
+        edge_y.append(None)
+
+    edge_trace = go.Scatter(
+        x=edge_x, y=edge_y,
+        line=dict(width=0.5, color='#888'),
+        hoverinfo='none',
+        mode='lines')
+
+    node_x = []
+    node_y = []
+    for node in G.nodes():
+        x, y = pos[node]
+        node_x.append(x)
+        node_y.append(y)
+
+    node_trace = go.Scatter(
+        x=node_x, y=node_y,
+        mode='markers+text',
+        hoverinfo='text',
+        marker=dict(
+            showscale=True,
+            colorscale='YlGnBu',
+            size=10,
+            colorbar=dict(
+                thickness=15,
+                title='Node Connections',
+                xanchor='left',
+                titleside='right'
+            ),
+            line_width=2),
+        text=[node for node in G.nodes()])
+
+    # Ajouter les poids des arêtes comme annotations
+    annotations = []
+    for edge in G.edges(data=True):
+        x0, y0 = pos[edge[0]]
+        x1, y1 = pos[edge[1]]
+        annotations.append(
+            dict(
+                x=(x0 + x1) / 2,
+                y=(y0 + y1) / 2,
+                text=str(edge[2]['weight']),
+                showarrow=False,
+                font=dict(color='red', size=10)
+            )
+        )
+
+    fig = go.Figure(data=[edge_trace, node_trace],
+                    layout=go.Layout(
+                        title='Collaborations Entre Pays (Interactions)',
+                        titlefont_size=16,
+                        showlegend=False,
+                        hovermode='closest',
+                        margin=dict(b=20, l=5, r=5, t=40),
+                        annotations=annotations,
+                        xaxis=dict(showgrid=False, zeroline=False),
+                        yaxis=dict(showgrid=False, zeroline=False))
+                    )
+
+    return fig
+
+def afficher_tableau(df):
+    fig = go.Figure(data=[go.Table(
+        header=dict(values=list(df.columns),
+                    fill_color='paleturquoise',
+                    align='left'),
+        cells=dict(values=[df[col] for col in df.columns],
+                   fill_color='lavender',
+                   align='left'))
+    ])
+    return fig
+
+
+def collaboration3():
+    collaboration_df = authors_with_country_df.alias("a").join(
+    authors_with_country_df.alias("b"),
+    (col("a.doi") == col("b.doi")) & (col("a.Country") < col("b.Country")),
+    "inner"
+).join(
+    authors_with_country_df.alias("c"),
+    (col("a.doi") == col("c.doi")) & 
+    (col("b.doi") == col("c.doi")) & 
+    (col("a.Country") < col("c.Country")) & 
+    (col("b.Country") < col("c.Country")),
+    "inner"
+).select(
+    array_sort(array("a.Country", "b.Country", "c.Country")).alias("countries"),
+    "a.doi"
+)
+
+    distinct_collaboration_df = collaboration_df.distinct()
+
+    country_collaboration_df = distinct_collaboration_df.groupBy("countries").agg(
+    count("doi").alias("collaboration_count")
+).orderBy(desc("collaboration_count"))
+    return country_collaboration_df
+
+
+
+@app.route('/plot_tableau_count_quartile_par_pays', methods=['GET'])
+def plot_tableau_count_quartile_par_pays():
+    try:
+        pandas_journaux_df = traiter_journaux(journaux_df).toPandas()  # Assurez-vous que cette fonction existe et que `journaux_df` est bien défini
+        new_data = {}
+        # Iterate over unique countries
+        for country in pandas_journaux_df['Country'].unique():
+            # Initialize counts for each quartile to zero
+            new_data[country] = {'Q1': 0, 'Q2': 0, 'Q3': 0, 'Q4': 0}
+            # Iterate over the dataframe rows for the current country
+            for index, row in pandas_journaux_df[pandas_journaux_df['Country'] == country].iterrows():
+                # Increment the count for the corresponding quartile
+                new_data[country][row['Quartile']] += 1
+
+        new_journaux_df = pd.DataFrame.from_dict(new_data, orient='index')
+        new_journaux_df['Country'] = new_journaux_df.index  # Add 'Country' column
+        fig = afficher_tableau(new_journaux_df)
+        fig_json = fig.to_json()
+        return jsonify({
+            "plotly_fig": fig_json
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/plot_tableau_article_par_an', methods=['GET'])
+def plot_tableau_article_par_an():
+    try:
+        # Extract the year from the extracted_date column
+        df_with_year = df_with_dates.withColumn(
+            "year",
+            regexp_extract(col("extracted_date"), r"\d{4}", 0)
+        )
+
+        # Group by year and count the number of articles
+        articles_by_year = df_with_year.groupBy("year").agg(count("*").alias("article_count"))
+
+        # Filter out rows without valid years (if needed)
+        articles_by_year = articles_by_year.filter(col("year") != "")
+        # Convert the Spark DataFrame to a Pandas DataFrame
+        articles_by_year_pd = articles_by_year.toPandas()
+        fig = afficher_tableau(articles_by_year_pd)
+        fig_json = fig.to_json()
+        return jsonify({
+            "plotly_fig": fig_json
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/plot_tableau_keywords', methods=['GET'])
+def plot_tableau_keywords():
+    try:
+        df_keywords_pandas = df_keywords_grouped.toPandas()
+        fig = afficher_tableau(df_keywords_pandas)
+        fig_json = fig.to_json()
+        return jsonify({
+            "plotly_fig": fig_json
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/plot_tableau_collaborations3', methods=['GET'])
+def plot_tableau_collaborations3():
+    try:
+        fig = afficher_tableau(collaboration3().toPandas())
+        fig_json = fig.to_json()
+        return jsonify({
+            "plotly_fig": fig_json
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/plot_tableau_collaborations2', methods=['GET'])
+def plot_tableau_collaborations2():
+    try:
+        fig = afficher_tableau(country_collaboration_df.toPandas())
+        fig_json = fig.to_json()
+        return jsonify({
+            "plotly_fig": fig_json
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+
+@app.route('/plot_tableau_articles', methods=['GET'])
+def plot_tableau_articles():
+    try:
+        fig = afficher_tableau(df_with_dates.toPandas())
+        fig_json = fig.to_json()
+        return jsonify({
+            "plotly_fig": fig_json
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/plot_tableau_labs', methods=['GET'])
+def plot_tableau_labs():
+    try:
+        fig = afficher_tableau(authors_labs_df.toPandas())
+        fig_json = fig.to_json()
+        return jsonify({
+            "plotly_fig": fig_json
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/plot_graph_collaborations', methods=['GET'])
+def plot_graph_collaborations():
+    try:
+        fig = generate_graph_collaborations()
+        fig_json = fig.to_json()
+        return jsonify({
+            "plotly_fig": fig_json
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
+
+@app.route('/plot_tableau_journaux', methods=['GET'])
+def plot_tableau_journaux():
+    try:
+        fig = generate_tableau_journaux()
+        fig_json = fig.to_json()
+        return jsonify({
+            "plotly_fig": fig_json
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/plot_map_articles_by_country', methods=['GET'])
 def plot_map_articles_by_country():
     try:
-        img_base64 = generate_map_articles_by_country()
+        fig = generate_map_articles_by_country()
+        fig_json = fig.to_json()
         return jsonify({
-            "plot_base64": img_base64
+            "plotly_fig": fig_json
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1304,9 +1570,10 @@ def plot_heatmap_articles_by_year_and_month():
 @app.route('/plot_3d_articles_by_journal', methods=['GET'])
 def plot_3d_articles_by_journal():
     try:
-        img_base64 = generate_3d_articles_by_journal()
+        fig = generate_3d_articles_by_journal()
+        fig_json = fig.to_json()
         return jsonify({
-            "plot_base64": img_base64
+            "plotly_fig": fig_json
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1315,9 +1582,10 @@ def plot_3d_articles_by_journal():
 @app.route('/plot_articles_by_journal', methods=['GET'])
 def plot_articles_by_journal():
     try:
-        img_base64 = generate_articles_by_journal()
+        fig = generate_articles_by_journal()
+        fig_json = fig.to_json()
         return jsonify({
-            "plot_base64": img_base64
+            "plotly_fig": fig_json
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1326,9 +1594,10 @@ def plot_articles_by_journal():
 @app.route('/plot_top_10_authors_with_most_articles', methods=['GET'])
 def plot_top_10_authors_with_most_articles():
     try:
-        img_base64 = generate_top_10_authors_with_most_articles()
+        fig = generate_top_10_authors_with_most_articles()
+        fig_json = fig.to_json()
         return jsonify({
-            "plot_base64": img_base64
+            "plotly_fig": fig_json
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1348,9 +1617,10 @@ def plot_wordcloud_keywords():
 @app.route('/plot_top_10_keywords', methods=['GET'])
 def plot_top_10_keywords():
     try:
-        img_base64 = generate_top_10_keywords()
+        fig = generate_top_10_keywords()
+        fig_json = fig.to_json()
         return jsonify({
-            "plot_base64": img_base64
+            "plotly_fig": fig_json
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1359,9 +1629,10 @@ def plot_top_10_keywords():
 @app.route('/plot_number_of_articles_par_date4', methods=['GET'])
 def plot_number_of_articles_par_date4():
     try:
-        img_base64 = generate_plot_number_of_articles_par_date4()
+        fig = generate_plot_number_of_articles_par_date4()
+        fig_json = fig.to_json()
         return jsonify({
-            "plot_base64": img_base64
+            "plotly_fig": fig_json
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1371,20 +1642,22 @@ def plot_number_of_articles_par_date4():
 @app.route('/plot_number_of_articles_par_date3', methods=['GET'])
 def plot_number_of_articles_par_date3():
     try:
-        img_base64 = generate_plot_number_of_articles_par_date3()
+        fig = generate_plot_number_of_articles_par_date3()
+        fig_json = fig.to_json()
         return jsonify({
-            "plot_base64": img_base64
+            "plotly_fig": fig_json
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('plot_number_of_articles_par_date2', methods=['GET'])
+@app.route('/plot_number_of_articles_par_date2', methods=['GET'])
 def plot_number_of_articles_par_date2():
     try:
-        img_base64 = generate_plot_number_of_articles_par_date2()
+        fig = generate_plot_number_of_articles_par_date2()
+        fig_json = fig.to_json()
         return jsonify({
-            "plot_base64": img_base64
+            "plotly_fig": fig_json
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1419,9 +1692,10 @@ def plot_number_of_articles_par_year():
 @app.route('/plot_map_authors', methods=['GET'])
 def plot_map_authors():
     try:
-        img_base64 = generate_map_authors()
+        fig = generate_map_authors()
+        fig_json = fig.to_json()
         return jsonify({
-            "plot_base64": img_base64
+            "plotly_fig": fig_json
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1431,9 +1705,10 @@ def plot_map_authors():
 @app.route('/plot_top_20_labs2', methods=['GET'])
 def plot_top_20_labs2():
     try:
-        img_base64 = genrate_plot_top_20_labs2()
+        fig = genrate_plot_top_20_labs2()
+        fig_json = fig.to_json()
         return jsonify({
-            "plot_base64": img_base64
+            "plotly_fig": fig_json
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1464,9 +1739,10 @@ def plot_authors_par_pays():
 @app.route('/plot_map_Q_par_Country', methods=['GET'])
 def plot_map_Q_par_Country():
     try:
-        img_base64 = generate_map_Q_par_Country()
+        figures = generate_map_Q_par_Country()
+        figures_json = [fig.to_json() for fig in figures]
         return jsonify({
-            "plot_base64": img_base64
+            "plotly_figs": figures_json
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1475,9 +1751,10 @@ def plot_map_Q_par_Country():
 #pip install -U kaleido
 def plot_bubble_chart_Q_par_Country():
     try:
-        img_base64 = generate_bubble_chart_Q_par_Country()
+        fig = generate_bubble_chart_Q_par_Country()
+        fig_json = fig.to_json()
         return jsonify({
-            "plot_base64": img_base64
+            "plotly_fig": fig_json
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1550,9 +1827,10 @@ def plot_wordcloud_categories_journaux():
 @app.route('/plot_heatmap_Q_par_Catego_Year', methods=['GET'])
 def plot_heatmap_Q_par_Catego_Year():
     try:
-        img_base64 = generate_heatmap_Q_par_Catego_Year()
+        fig = generate_heatmap_Q_par_Catego_Year()
+        fig_json = fig.to_json()
         return jsonify({
-            "plot_base64": img_base64
+            "plotly_fig": fig_json
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1617,4 +1895,4 @@ def clean_and_plot():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(use_reloader=False, debug=True)
